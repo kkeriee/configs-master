@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: v2collector
-    env: python
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn src.app:app --host 0.0.0.0 --port $PORT"
