@@ -1,16 +1,17 @@
-# src/app.py
 import os
 import asyncio
 import traceback
-import inspect
-from typing import Optional, Any, Dict
-
+import re
+from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+import sqlalchemy as sa
 
-# local DB init (keeps original behaviour)
-from .db import init_db
+from .telegram_client import TelegramClient
+from .workers.job_manager import JobManager
+from .db import get_engine, init_db
+from .db.models import configs
 
 load_dotenv()
 
@@ -20,293 +21,241 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 if not TELEGRAM_WEBHOOK_SECRET or not TELEGRAM_BOT_TOKEN:
     raise RuntimeError('Please set TELEGRAM_WEBHOOK_SECRET and TELEGRAM_BOT_TOKEN in env')
 
-app = FastAPI(title="Configs service")
+app = FastAPI(title="Configs service - interactive")
 
-# --- Background task scheduler with robust exception handling ---
-_background_tasks = set()
+# singletons
+tg_client: Optional[TelegramClient] = None
+job_manager: Optional[JobManager] = None
 
-def schedule_task(coro):
-    """
-    Schedule coro as a background task and attach a done-callback that
-    logs exceptions and removes the task from the active set.
-    Accepts either a coroutine or a callable that returns a coroutine.
-    """
+# simple in-memory conversation state: chat_id -> state dict
+# state = {'expecting': 'count', 'country': 'DE'}
+chat_state: Dict[int, Dict[str, Any]] = {}
+
+# helper for country flag conversions
+def country_code_to_flag(cc: str) -> str:
+    cc = (cc or "").upper()
+    if len(cc) != 2:
+        return cc
+    return chr(ord(cc[0]) - ord('A') + 0x1F1E6) + chr(ord(cc[1]) - ord('A') + 0x1F1E6)
+
+def flag_to_country_code(flag: str) -> Optional[str]:
+    # match two regional indicators
+    RIS_BASE = 0x1F1E6
+    if not flag:
+        return None
+    # extract codepoints
+    codepoints = [ord(ch) for ch in flag if ord(ch) >= RIS_BASE and ord(ch) <= RIS_BASE+26]
+    if len(codepoints) < 2:
+        return None
     try:
-        if not asyncio.iscoroutine(coro):
-            # if user passed a callable that returns coroutine, call it
-            if callable(coro):
-                maybe = coro()
-                if inspect.isawaitable(maybe):
-                    coroutine = maybe
-                else:
-                    # if callable returned non-awaitable, wrap it
-                    async def _wrap(): return maybe
-                    coroutine = _wrap()
-            else:
-                # not coroutine nor callable
-                raise RuntimeError("schedule_task expects coroutine or callable returning coroutine")
+        a = chr(codepoints[0] - RIS_BASE + ord('A'))
+        b = chr(codepoints[1] - RIS_BASE + ord('A'))
+        return (a + b)
+    except Exception:
+        return None
+
+async def send_country_list(chat_id: int):
+    """Query DB for counts by country and send a message with flags and counts."""
+    eng = get_engine()
+    async with eng.connect() as conn:
+        q = sa.select([configs.c.country, sa.func.count(configs.c.id).label('cnt')]).where(configs.c.ok==True).group_by(configs.c.country).order_by(sa.func.count(configs.c.id).desc())
+        res = await conn.execute(q)
+        rows = res.fetchall()
+    if not rows:
+        await tg_client.send_message(chat_id, "База пуста. Запустите новый поиск через «Новый поиск».")
+        return
+    lines = []
+    buttons = []
+    for row in rows:
+        country = row[0] or 'Unknown'
+        cnt = row[1]
+        # try to use country code (2 letters) else show name
+        if isinstance(country,str) and len(country)==2:
+            flag = country_code_to_flag(country)
+            label = f"{flag} {country} | {cnt}"
+            # button callback uses country code
+            buttons.append([{"text": f"{flag} {country} ({cnt})", "callback_data": f"pick:{country}"}])
         else:
-            coroutine = coro
-    except Exception as e:
-        print("schedule_task: failed to prepare coroutine:", e, traceback.format_exc())
-        raise
+            label = f"{country} | {cnt}"
+            buttons.append([{"text": f"{country} ({cnt})", "callback_data": f"pick:{country}"}])
+        lines.append(label)
+    summary = "Доступные конфиги по странам:\n" + "\n".join(lines) + "\n\nНажмите на флаг или название страны в кнопках ниже, чтобы запросить конфиги."
+    # split buttons into pages if too many (Telegram limits ~100 buttons)
+    # send as keyboard
+    try:
+        await tg_client.send_keyboard(chat_id, summary, buttons)
+    except Exception:
+        # fallback to plain text
+        await tg_client.send_message(chat_id, summary)
 
-    task = asyncio.create_task(coroutine)
+# schedule helper
+_background_tasks = set()
+def schedule_task(coro):
+    if not asyncio.iscoroutine(coro):
+        coro = coro()
+    task = asyncio.create_task(coro)
     _background_tasks.add(task)
-
     def _cb(t):
         try:
             _background_tasks.discard(t)
             exc = None
             try:
                 exc = t.exception()
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                print("schedule_task callback: error getting exception:", e)
-            if exc is not None:
-                print("Background task exception:", repr(exc))
-                print("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-        except Exception as e:
-            print("Error in task callback:", e, traceback.format_exc())
-
+            except Exception:
+                pass
+            if exc:
+                print("Background task exception:", exc)
+        except Exception:
+            print("Error in task callback", traceback.format_exc())
     task.add_done_callback(_cb)
     return task
 
-# --- Install a global exception handler for the loop to avoid unhandled futures crashing the process ---
-@app.on_event('startup')
-async def _install_loop_exception_handler():
-    loop = asyncio.get_event_loop()
-
-    def _exc_handler(loop, context):
-        try:
-            msg = context.get('message') or str(context.get('exception'))
-            print('Loop exception:', msg)
-        except Exception:
-            print('Loop exception (unable to format)')
-    try:
-        loop.set_exception_handler(_exc_handler)
-    except Exception:
-        pass
-
-# placeholders for singletons
-app.state.tg_client = None
-app.state.job_manager = None
-
-# --- Startup: init DB, telegram client and job manager safely ---
 @app.on_event('startup')
 async def startup():
-    # init DB (best-effort)
+    global tg_client, job_manager
     try:
         await init_db()
-        print("DB initialized")
     except Exception:
-        print("DB init failed:", traceback.format_exc())
+        print("DB init failed", traceback.format_exc())
+    tg_client = TelegramClient(bot_token=TELEGRAM_BOT_TOKEN)
+    job_manager = JobManager(tg_client)
+    print("Startup complete: tg_client and job_manager ready")
 
-    # import TelegramClient and JobManager lazily to avoid import cycles
-    try:
-        from .telegram_client import TelegramClient
-        from .workers.job_manager import JobManager
-    except Exception as e:
-        print("Failed to import TelegramClient or JobManager on startup:", e, traceback.format_exc())
-        return
-
-    # instantiate telegram client
-    try:
-        tg = TelegramClient(bot_token=TELEGRAM_BOT_TOKEN)
-        # if the client requires async init/start, call it if present
-        for candidate in ('init', 'start', 'connect'):
-            fn = getattr(tg, candidate, None)
-            if callable(fn):
-                try:
-                    res = fn()
-                    if inspect.isawaitable(res):
-                        await res
-                except Exception:
-                    print(f"TelegramClient.{candidate}() raised:", traceback.format_exc())
-                break
-        app.state.tg_client = tg
-        print("TelegramClient initialized")
-    except Exception:
-        print("Failed to initialize TelegramClient:", traceback.format_exc())
-        app.state.tg_client = None
-
-    # create job manager
-    try:
-        if app.state.tg_client is not None:
-            job_manager = JobManager(app.state.tg_client)
-            app.state.job_manager = job_manager
-            print("JobManager initialized")
-        else:
-            print("JobManager not created because tg_client is None")
-    except Exception:
-        print("Failed to initialize JobManager:", traceback.format_exc())
-        app.state.job_manager = None
-
-# --- Shutdown: close sessions and cancel background tasks gracefully ---
-@app.on_event('shutdown')
-async def shutdown():
-    # try closing telegram client/session
-    try:
-        tg = getattr(app.state, "tg_client", None)
-        if tg is not None:
-            closed = False
-            for attr in ("close", "shutdown", "session_close", "stop"):
-                fn = getattr(tg, attr, None)
-                if callable(fn):
-                    try:
-                        res = fn()
-                        if inspect.isawaitable(res):
-                            await res
-                        closed = True
-                        break
-                    except Exception:
-                        print(f"Error calling tg.{attr}():", traceback.format_exc())
-            sess = getattr(tg, "session", None)
-            if sess is not None:
-                try:
-                    c = getattr(sess, "close", None)
-                    if callable(c):
-                        maybe = c()
-                        if inspect.isawaitable(maybe):
-                            await maybe
-                except Exception:
-                    print("Error closing tg.session:", traceback.format_exc())
-            if closed:
-                print("Telegram client closed")
-    except Exception:
-        print("Error during shutdown tg cleanup:", traceback.format_exc())
-
-    # cancel background tasks (give short grace period)
-    try:
-        tasks = list(_background_tasks)
-        if tasks:
-            for t in tasks:
-                try:
-                    t.cancel()
-                except Exception:
-                    pass
-            await asyncio.sleep(0.2)
-    except Exception:
-        print("Error while cancelling background tasks:", traceback.format_exc())
-
-# --- Health endpoint ---
-@app.get('/healthz')
-async def health():
-    return JSONResponse({'status':'ok'})
-
-# helper to extract chat_id/message_id from update for fallback
-def extract_chat_info(update: Dict[str, Any]) -> Dict[str, Optional[int]]:
-    try:
-        if not isinstance(update, dict):
-            return {'chat_id': None, 'message_id': None}
-        if 'message' in update and isinstance(update['message'], dict):
-            msg = update['message']
-            chat = msg.get('chat', {})
-            return {'chat_id': chat.get('id'), 'message_id': msg.get('message_id')}
-        if 'callback_query' in update and isinstance(update['callback_query'], dict):
-            cq = update['callback_query']
-            if 'message' in cq and isinstance(cq['message'], dict):
-                msg = cq['message']
-                chat = msg.get('chat', {})
-                return {'chat_id': chat.get('id'), 'message_id': msg.get('message_id')}
-        # other update types can be added here
-    except Exception:
-        print("extract_chat_info error:", traceback.format_exc())
-    return {'chat_id': None, 'message_id': None}
-
-# --- Webhook handler with robust fallback if job_manager lacks handle_update ---
 @app.post('/webhook/{secret}')
-async def telegram_webhook(request: Request, secret: str, x_telegram_secret: Optional[str] = Header(None, alias="X-Telegram-Bot-Api-Secret-Token")):
-    # validate secret (both path and header must match)
+async def webhook(request: Request, secret: str, x_telegram_secret: Optional[str] = Header(None, alias="X-Telegram-Bot-Api-Secret-Token")):
+    # validate secret
     try:
-        if TELEGRAM_WEBHOOK_SECRET:
-            if secret != TELEGRAM_WEBHOOK_SECRET or x_telegram_secret != TELEGRAM_WEBHOOK_SECRET:
-                return JSONResponse(status_code=401, content={"ok": False, "error": "invalid secret"})
+        if secret != TELEGRAM_WEBHOOK_SECRET or x_telegram_secret != TELEGRAM_WEBHOOK_SECRET:
+            return JSONResponse(status_code=401, content={"ok": False, "error": "invalid secret"})
     except Exception:
-        print("Secret check failure:", traceback.format_exc())
-        return JSONResponse(status_code=401, content={"ok": False, "error": "secret check error"})
+        return JSONResponse(status_code=401, content={"ok": False, "error": "secret check failed"})
 
-    # parse json body
     try:
         update = await request.json()
     except Exception:
-        print("Webhook: invalid JSON payload:", traceback.format_exc())
         return JSONResponse(status_code=400, content={"ok": False, "error": "invalid json"})
 
-    # schedule background processing with graceful fallback
-    try:
-        jm = getattr(app.state, "job_manager", None)
-        if jm is None:
-            # try lazy init (best-effort) if job_manager missing
-            try:
-                from .telegram_client import TelegramClient
-                from .workers.job_manager import JobManager
-                tg = getattr(app.state, "tg_client", None)
-                if tg is None:
-                    tg = TelegramClient(bot_token=TELEGRAM_BOT_TOKEN)
-                    # attempt to call init methods if present
-                    init_maybe = getattr(tg, "init", None)
-                    if callable(init_maybe):
-                        maybe = init_maybe()
-                        if inspect.isawaitable(maybe):
-                            await maybe
-                    app.state.tg_client = tg
-                jm = JobManager(app.state.tg_client)
-                app.state.job_manager = jm
-                print("Webhook: lazily created JobManager")
-            except Exception:
-                print("Webhook: failed to lazily init JobManager:", traceback.format_exc())
-                # schedule a logger task and return 200 to avoid repeated deliveries
-                async def _log_update():
-                    print("Webhook: received update but job_manager missing; update keys:", list(update.keys())[:8])
-                try:
-                    schedule_task(_log_update())
-                except Exception:
-                    print("Webhook: failed to schedule fallback logger task")
-                return JSONResponse(status_code=200, content={"ok": True})
-
-        # if job_manager has handle_update — use it (preferred)
-        if hasattr(jm, "handle_update") and callable(getattr(jm, "handle_update")):
-            try:
-                schedule_task(jm.handle_update(update))
-            except Exception:
-                print("Webhook: scheduling jm.handle_update failed:", traceback.format_exc())
-                return JSONResponse(status_code=200, content={"ok": True})
-            return JSONResponse(status_code=200, content={"ok": True})
-
-        # fallback: if job_manager implements run_collection(chat_id, edit_chat=None, edit_msg=None), call it with extracted chat_id
-        chat_info = extract_chat_info(update)
-        chat_id = chat_info.get('chat_id')
-
-        if hasattr(jm, "run_collection") and callable(getattr(jm, "run_collection")) and chat_id is not None:
-            try:
-                # call run_collection(chat_id) in background
-                schedule_task(jm.run_collection(chat_id))
-            except Exception:
-                print("Webhook: scheduling jm.run_collection failed:", traceback.format_exc())
-                # log and return 200
-            return JSONResponse(status_code=200, content={"ok": True})
-
-        # last resort: try a generic handler names that might exist
-        for alt in ("process_update", "handle", "process", "on_update"):
-            if hasattr(jm, alt) and callable(getattr(jm, alt)):
-                try:
-                    schedule_task(getattr(jm, alt)(update))
-                except Exception:
-                    print(f"Webhook: scheduling jm.{alt} failed:", traceback.format_exc())
-                return JSONResponse(status_code=200, content={"ok": True})
-
-        # nothing to handle: schedule lightweight logger and return ok to Telegram
-        async def _log_unknown():
-            print("Webhook: job_manager lacks handler methods; update keys:", list(update.keys())[:12])
+    # handle callback_query (inline buttons)
+    if 'callback_query' in update:
+        cq = update['callback_query']
+        data = cq.get('data')
+        from_user = cq.get('from',{})
+        chat = cq.get('message',{}).get('chat',{})
+        chat_id = chat.get('id') or from_user.get('id')
+        # answer callback quickly
         try:
-            schedule_task(_log_unknown())
+            await tg_client.answer_callback(cq.get('id'), text="Обработка...")
         except Exception:
-            print("Webhook: failed to schedule logger for unknown handler")
-        return JSONResponse(status_code=200, content={"ok": True})
+            pass
+        if data == 'configs:new':
+            # start new search
+            # send initial message to user and get message ids
+            resp = await tg_client.send_message(chat_id, "Запуск нового поиска конфигов...")
+            edit_chat, edit_msg = (resp if isinstance(resp, tuple) else (chat_id, None))
+            # schedule collection
+            try:
+                schedule_task(job_manager.run_collection(chat_id, edit_chat, edit_msg))
+            except Exception:
+                print("Failed to schedule run_collection", traceback.format_exc())
+            return JSONResponse({'ok': True})
+        if data == 'configs:use':
+            # send list of countries and buttons
+            schedule_task(send_country_list(chat_id))
+            return JSONResponse({'ok': True})
+        if data and data.startswith('pick:'):
+            country = data.split(':',1)[1]
+            # store state expecting count
+            chat_state[chat_id] = {'expecting':'count', 'country': country}
+            await tg_client.send_message(chat_id, f"Вы выбрали {country}. Сколько конфигов прислать? Введите число (например: 10)")
+            return JSONResponse({'ok': True})
 
+    # handle normal message
+    msg = update.get('message') or update.get('edited_message') or {}
+    text = (msg.get('text') or '').strip() if isinstance(msg, dict) else ''
+    from_user = msg.get('from',{})
+    chat = msg.get('chat',{})
+    chat_id = chat.get('id') or from_user.get('id')
+
+    # if user sends /configs -> show inline options
+    if text.startswith('/configs'):
+        # send inline keyboard: New search / Use DB
+        buttons = [
+            [{"text":"Новый поиск", "callback_data":"configs:new"}],
+            [{"text":"Использовать базу", "callback_data":"configs:use"}]
+        ]
+        try:
+            await tg_client.send_keyboard(chat_id, "Хотите произвести новый поиск или воспользоваться уже существующей базой?", buttons)
+        except Exception:
+            await tg_client.send_message(chat_id, "Хотите произвести новый поиск или воспользоваться уже существующей базой?\nReply with 'new' or 'use'")
+        return JSONResponse({'ok': True})
+
+    # if expecting a count after selecting country
+    state = chat_state.get(chat_id)
+    if state and state.get('expecting') == 'count':
+        # check if text is an integer
+        try:
+            count = int(re.findall(r'\d+', text)[0])
+        except Exception:
+            await tg_client.send_message(chat_id, "Пожалуйста, введите корректное число (например: 10)")
+            return JSONResponse({'ok': True})
+        country = state.get('country')
+        # clear state
+        chat_state.pop(chat_id, None)
+        # fetch configs and send
+        schedule_task(send_configs_for_country(chat_id, country, count))
+        return JSONResponse({'ok': True})
+
+    # if user sends a flag emoji directly, interpret it
+    if text and any('\U0001F1E6' <= ch <= '\U0001F1FF' for ch in text):
+        # try to get country code from flag
+        country = flag_to_country_code(text)
+        if country:
+            chat_state[chat_id] = {'expecting':'count', 'country': country}
+            await tg_client.send_message(chat_id, f"Вы выбрали {country}. Сколько конфигов прислать? Введите число (например: 10)")
+            return JSONResponse({'ok': True})
+
+    # otherwise, default processing: let existing pipeline handle
+    try:
+        schedule_task(job_manager.handle_update(update))
     except Exception:
-        print("Webhook: unexpected failure:", traceback.format_exc())
-        # return 200 to acknowledge receipt, avoid retries
-        return JSONResponse(status_code=200, content={"ok": True})
+        # fallback: log and return ok
+        print("Failed to schedule handle_update:", traceback.format_exc())
+    return JSONResponse({'ok': True})
+
+async def send_configs_for_country(chat_id: int, country: str, count: int):
+    """Fetch configs from DB and send to user in chunks (or as file)"""
+    eng = get_engine()
+    async with eng.connect() as conn:
+        q = sa.select([configs.c.raw]).where(sa.func.coalesce(configs.c.country, 'Unknown') == country).where(configs.c.ok==True).limit(count)
+        res = await conn.execute(q)
+        rows = [r[0] for r in res.fetchall()]
+    if not rows:
+        await tg_client.send_message(chat_id, f"Нет конфигов для страны {country}")
+        return
+    # prepare formatted text (each raw on new line)
+    lines = rows
+    # chunk into messages of <=3900 chars
+    cur = []
+    cur_len = 0
+    chunks = []
+    for line in lines:
+        ln = len(line) + 1
+        if cur_len + ln > 3800 and cur:
+            chunks.append('\\n'.join(cur))
+            cur = [line]
+            cur_len = ln
+        else:
+            cur.append(line)
+            cur_len += ln
+    if cur:
+        chunks.append('\\n'.join(cur))
+    # send chunks or file
+    if len(chunks) <= 8:
+        for c in chunks:
+            await tg_client.send_message(chat_id, c)
+    else:
+        # send as .txt document
+        all_text = '\\n'.join(lines)
+        fname = f'configs_{country}_{count}.txt'
+        await tg_client.send_document(chat_id, fname, all_text.encode('utf-8'), caption=f'Configs {country} ({count})')
+    await tg_client.send_message(chat_id, "Готово. Конфиги отправлены.")

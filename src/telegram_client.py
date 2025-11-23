@@ -77,6 +77,29 @@ class TelegramClient:
                     return (d['result']['chat']['id'], d['result']['message_id'])
                 return None
 
+    async def send_keyboard(self, chat_id: int, text: str, buttons: list, reply_to_message_id=None) -> Optional[Tuple[int,int]]:
+        """
+        Send a message with inline keyboard.
+        buttons: list of rows, each row is list of {'text':..,'callback_data':..}
+        """
+        payload = {'chat_id': chat_id, 'text': text, 'reply_markup': {'inline_keyboard': buttons}}
+        if reply_to_message_id:
+            payload['reply_to_message_id'] = reply_to_message_id
+        async with self._lock:
+            async with self.session.post(f'{self.api}/sendMessage', json=payload) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {}
+        if data.get('ok') and data.get('result'):
+            d = data['result']
+            # return (chat_id, message_id)
+            if 'chat' in d and 'id' in d['chat'] and 'message_id' in d:
+                return (d['chat']['id'], d['message_id'])
+            if 'message_id' in d:
+                return (chat_id, d['message_id'])
+        return None
+
     async def answer_callback(self, callback_query_id: str, text: str = None, show_alert: bool = False):
         data = {'callback_query_id': callback_query_id}
         if text:
