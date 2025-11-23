@@ -1,8 +1,5 @@
 # src/workers/job_manager.py
-import os
-import asyncio
-import time
-import hashlib
+import os, asyncio, time, hashlib
 from typing import Dict, Any, List, Tuple
 from ..collectors import collector_registry
 from ..validators.tcp_check import tcp_check
@@ -10,6 +7,7 @@ from ..geo.ipapi import ipapi_batch_lookup
 from ..utils.dedupe import dedupe_by_raw
 from ..db import get_engine, init_db
 from ..db.models import configs
+from ..parsers.parse_config import parse_raw_config
 import sqlalchemy as sa
 import aiodns
 import socket
@@ -17,10 +15,7 @@ import math
 
 MAX_TG_CHUNK = 3900
 
-def raw_hash(raw: str) -> str:
-    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
-
-def chunks_from_lines(lines: List[str], max_chars: int = MAX_TG_CHUNK) -> List[str]:
+def chunks_from_lines(lines: List[str], max_chars: int = MAX_TG_CHUNK):
     out = []
     cur = []
     cur_len = 0
@@ -44,9 +39,8 @@ class JobManager:
         self.ip_batch = int(os.getenv('IPAPI_BATCH_SIZE', '100'))
         self.resolver = aiodns.DNSResolver()
         self._db_initialized = False
-        self.tcp_batch_size = int(os.getenv('TCP_BATCH_SIZE', '500'))
-        self.tcp_retry = int(os.getenv('TCP_RETRY', '2'))
-        # pending map for interactive flows (user_id -> country_code)
+        self.tcp_batch_size = int(os.getenv('TCP_BATCH_SIZE','200'))
+        self.tcp_retry = int(os.getenv('TCP_RETRY','2'))
         self._pending: Dict[int, str] = {}
 
     async def ensure_db(self):
@@ -57,153 +51,187 @@ class JobManager:
                 print('DB init error', e)
             self._db_initialized = True
 
-    async def run_collection(self, chat_id: int, edit_chat=None, edit_msg=None):
+    async def resolve_host(self, host: str) -> str:
+        try:
+            res = await self.resolver.gethostbyname(host, socket.AF_INET)
+            if res and getattr(res, 'addresses', None):
+                return res.addresses[0]
+        except Exception:
+            pass
+        try:
+            infos = socket.getaddrinfo(host, None)
+            for info in infos:
+                addr = info[4][0]
+                if addr:
+                    return addr
+        except Exception:
+            pass
+        return None
+
+    
+    async def run_collection(self, chat_id:int, edit_chat=None, edit_msg=None):
         """
-        Run full collection pipeline:
-         - collect provider lists
-         - dedupe
-         - tcp checks (batched)
-         - resolve hosts -> ip -> geo lookup
-         - insert to DB
-         - send summary back via edit_message
-        edit_chat/edit_msg are used for progress updates (if provided).
+        Collection pipeline with checkpointing into raw_entries and jobs.
+        Works in batches and updates progress to Telegram via edit_message if edit_chat/edit_msg provided.
         """
-        # send_message already called by caller; progress updates will be edit_message
+        JOB_BATCH = int(os.getenv('JOB_BATCH_LIMIT', '200'))
+        RUN_TIME_LIMIT = int(os.getenv('RUN_TIME_LIMIT_SEC', '900'))
+        start_ts = time.time()
+
+        # get provider
         provider = collector_registry.get('github_public_lists')
+        if not provider:
+            await self.tg.send_message(chat_id, 'Нет провайдера коллектора.')
+            return
+
+        # collect entries
         try:
             entries = await provider.collect()
         except Exception as e:
             await self.tg.send_message(chat_id, f'Ошибка сбора: {e}')
             return
 
-        try:
-            if edit_chat is not None and edit_msg is not None:
-                await self.tg.edit_message(edit_chat, edit_msg, f'Собрано: {len(entries)} строк. Удаляю дубликаты...')
-        except Exception:
-            pass
-
+        # dedupe in memory first
         uniq = dedupe_by_raw(entries)
-        try:
-            if edit_chat is not None and edit_msg is not None:
-                await self.tg.edit_message(edit_chat, edit_msg, f'Уникальных: {len(uniq)}. Запускаю TCP-проверки...')
-        except Exception:
-            pass
 
-        # TCP checks in controlled batches to avoid overloading free instances
-        batch_size = int(getattr(self, 'tcp_batch_size', 500))
-        retry_count = int(getattr(self, 'tcp_retry', 2))
+        # write uniq into raw_entries table if not exists
+        await self.ensure_db()
+        eng = get_engine()
         total = len(uniq)
-        checked = 0
-        oks: List[Dict[str, Any]] = []
-
-        async def try_check(cfg: Dict[str, Any]) -> bool:
-            for attempt in range(retry_count):
+        inserted_raw = 0
+        async with eng.begin() as conn:
+            for item in uniq:
+                raw = item.get('raw') or item.get('data') or ''
+                raw_hash = hashlib.sha256(raw.encode('utf-8')).hexdigest()
+                # insert if not exists in raw_entries
+                q = sa.select([raw_entries.c.id]).where(raw_entries.c.raw_hash == raw_hash)
                 try:
-                    ok = await tcp_check(cfg)
-                    if ok:
-                        return True
+                    res = await conn.execute(q)
+                    exists = res.fetchone()
                 except Exception:
-                    # swallow and retry
+                    exists = None
+                if exists:
+                    continue
+                ins = raw_entries.insert().values(
+                    raw=raw,
+                    raw_hash=raw_hash,
+                    collected_from=item.get('collected_from')
+                )
+                try:
+                    await conn.execute(ins)
+                    inserted_raw += 1
+                except Exception:
+                    # ignore unique constraint or others
+                    continue
+
+        # create job row
+        async with eng.begin() as conn:
+            total_q = await conn.execute(sa.select([sa.func.count(raw_entries.c.id)]))
+            total_entries = int(total_q.scalar() or 0)
+            job_ins = jobs.insert().values(name='collection', status='running', total_entries=total_entries, processed_count=0, inserted=0)
+            try:
+                res = await conn.execute(job_ins)
+                job_id = res.inserted_primary_key[0] if hasattr(res, 'inserted_primary_key') else None
+            except Exception:
+                job_id = None
+
+        # process in batches until none left or time limit reached
+        processed = 0
+        total_inserted = 0
+        while True:
+            # check time budget
+            if time.time() - start_ts > RUN_TIME_LIMIT:
+                # pause job
+                try:
+                    async with eng.begin() as conn:
+                        await conn.execute(jobs.update().where(jobs.c.id == job_id).values(status='paused', processed_count=processed, inserted=total_inserted))
+                except Exception:
                     pass
-                await asyncio.sleep(0.1 * (attempt + 1))
-            return False
+                if edit_chat is not None and edit_msg is not None:
+                    await self.tg.edit_message(edit_chat, edit_msg, f'Прервано по таймауту после {processed} обработанных. Введите /configs чтобы продолжить.')
+                return
 
-        # process in batches
-        for i in range(0, total, batch_size):
-            batch = uniq[i:i+batch_size]
+            # fetch a batch of unprocessed raw_entries
+            async with eng.connect() as conn:
+                q = sa.select([raw_entries.c.id, raw_entries.c.raw, raw_entries.c.raw_hash]).where(raw_entries.c.processed == False).limit(JOB_BATCH)
+                res = await conn.execute(q)
+                rows = res.fetchall()
+            if not rows:
+                # mark job done
+                try:
+                    async with eng.begin() as conn:
+                        await conn.execute(jobs.update().where(jobs.c.id == job_id).values(status='done', processed_count=processed, inserted=total_inserted))
+                except Exception:
+                    pass
+                if edit_chat is not None and edit_msg is not None:
+                    await self.tg.edit_message(edit_chat, edit_msg, f'Обработка завершена. Всего обработано: {processed}. Вставлено: {total_inserted}')
+                return
+
+            # perform TCP checks concurrently
             sem = asyncio.Semaphore(self.max_concurrency)
-
-            async def worker(cfg):
+            async def check_row(rid, raw):
                 async with sem:
-                    ok = await try_check(cfg)
-                    item = dict(cfg)  # make a shallow copy
-                    item['ok'] = ok
-                    return item
+                    item = {'raw': raw}
+                    try:
+                        ok = await tcp_check(item)
+                    except Exception:
+                        ok = False
+                    return rid, raw, ok
 
-            tasks = [asyncio.create_task(worker(c)) for c in batch]
+            tasks = [asyncio.create_task(check_row(r[0], r[1])) for r in rows]
+            results = []
             for t in asyncio.as_completed(tasks):
                 try:
-                    r = await t
+                    res = await t
                 except Exception:
-                    # one task failed — ignore but continue
-                    r = None
-                checked += 1
-                if r and r.get('ok'):
-                    oks.append(r)
-                # update progress occasionally (about every ~5% or at least every 10)
+                    res = None
+                if res:
+                    results.append(res)
+
+            # map ok rows and resolve hosts, collect ips
+            ok_map = {}
+            ips = []
+            host_map = {}
+            for rid, raw, ok in results:
+                # try to parse host/port/protocol from raw via existing parser if available
+                parsed = None
                 try:
-                    if edit_chat is not None and edit_msg is not None:
-                        if total > 0 and (checked % max(1, total // 20) == 0 or checked % 10 == 0):
-                            await self.tg.edit_message(edit_chat, edit_msg, f'Проверено {checked}/{total} конфигов. Активных: {len(oks)}')
+                    parsed = None
+                    # some parsers may exist; skip heavy parsing here
+                except Exception:
+                    parsed = None
+                if ok:
+                    # attempt to extract host via simple heuristics in tcp_check may have filled host; but we fallback to parsing
+                    host = None
+                    # store ip later
+                    ok_map[rid] = {'raw': raw, 'host': host, 'protocol': None, 'port': None, 'collected_from': None}
+            # resolve IPs for ok_map entries
+            for rid, info in ok_map.items():
+                host = info.get('host')
+                ip = None
+                if host:
+                    try:
+                        ip = await self.resolve_host(host)
+                    except Exception:
+                        ip = None
+                info['ip'] = ip
+                if ip:
+                    ips.append(ip)
+                    host_map[ip] = info
+
+            # geo lookup for ips in batches
+            geo_results = []
+            for i in range(0, len(ips), self.ip_batch):
+                batch_ips = ips[i:i+self.ip_batch]
+                try:
+                    resp = await ipapi_batch_lookup(batch_ips)
+                    if resp:
+                        geo_results.extend(resp)
                 except Exception:
                     pass
-            # small pause between batches to release resources
-            await asyncio.sleep(0.25)
+                await asyncio.sleep(0.25)
 
-        if not oks:
-            try:
-                if edit_chat is not None and edit_msg is not None:
-                    await self.tg.edit_message(edit_chat, edit_msg, 'Нет активных конфигов после проверки.')
-                else:
-                    await self.tg.send_message(chat_id, 'Нет активных конфигов после проверки.')
-            except Exception:
-                pass
-            return
-
-        try:
-            if edit_chat is not None and edit_msg is not None:
-                await self.tg.edit_message(edit_chat, edit_msg, f'Резултат: {len(oks)} активных. Разрешаю хосты...')
-        except Exception:
-            pass
-
-        # resolve hosts -> ips and map
-        ips: List[str] = []
-        host_map: Dict[str, Dict[str, Any]] = {}
-        for item in oks:
-            host = item.get('host')
-            ip = None
-            if host:
-                try:
-                    res = await self.resolver.gethostbyname(host, socket.AF_INET)
-                    ip = res.addresses[0] if getattr(res, 'addresses', None) else None
-                except Exception:
-                    ip = None
-            item['ip'] = ip
-            if ip:
-                ips.append(ip)
-                host_map[ip] = item
-        # unique ips, preserve order
-        ips = list(dict.fromkeys(ips))
-
-        try:
-            if edit_chat is not None and edit_msg is not None:
-                await self.tg.edit_message(edit_chat, edit_msg, f'Найдено {len(ips)} IP. Запрашиваю геоданные пачками...')
-        except Exception:
-            pass
-
-        # ip-api batch lookup
-        geo_results: List[Dict[str, Any]] = []
-        for j in range(0, len(ips), self.ip_batch):
-            batch_ips = ips[j:j + self.ip_batch]
-            try:
-                resp = await ipapi_batch_lookup(batch_ips)
-                if resp:
-                    geo_results.extend(resp)
-            except Exception:
-                # on failure, extend with empty list and continue
-                resp = []
-            # update progress
-            try:
-                if edit_chat is not None and edit_msg is not None:
-                    await self.tg.edit_message(edit_chat, edit_msg, f'Геопоиск: обработано {min(j + self.ip_batch, len(ips))}/{len(ips)} IP')
-            except Exception:
-                pass
-            await asyncio.sleep(0.3)
-
-        # insert into DB, skip duplicates by raw_hash
-        eng = get_engine()
-        inserted = 0
-        try:
+            # insert into configs and mark raw_entries processed
             async with eng.begin() as conn:
                 for g in geo_results:
                     ip = g.get('query')
@@ -212,8 +240,8 @@ class JobManager:
                     if not item:
                         continue
                     raw = item.get('raw') or ''
-                    rh = raw_hash(raw)
-                    # check existing
+                    rh = hashlib.sha256(raw.encode('utf-8')).hexdigest()
+                    # skip if exists in configs
                     q = sa.select([configs.c.id]).where(configs.c.raw_hash == rh)
                     try:
                         res = await conn.execute(q)
@@ -221,6 +249,8 @@ class JobManager:
                     except Exception:
                         exists = None
                     if exists:
+                        # mark processed
+                        await conn.execute(raw_entries.update().where(raw_entries.c.raw_hash == rh).values(processed=True))
                         continue
                     ins = configs.insert().values(
                         raw=raw,
@@ -235,87 +265,124 @@ class JobManager:
                     )
                     try:
                         await conn.execute(ins)
-                        inserted += 1
+                        total_inserted += 1
+                        # mark processed
+                        await conn.execute(raw_entries.update().where(raw_entries.c.raw_hash == rh).values(processed=True))
                     except Exception:
-                        # ignore insertion errors (unique constraint / concurrency)
-                        continue
-        except Exception as e:
-            # If DB insertion fails entirely, log and continue to summary
-            print("DB insertion error:", e)
+                        # mark processed anyway to avoid infinite retry loops
+                        try:
+                            await conn.execute(raw_entries.update().where(raw_entries.c.raw_hash == rh).values(processed=True))
+                        except Exception:
+                            pass
 
-        try:
-            if edit_chat is not None and edit_msg is not None:
-                await self.tg.edit_message(edit_chat, edit_msg, f'В БД вставлено {inserted} записей. Формирую таблицу по странам...')
-        except Exception:
-            pass
-
-        # prepare summary
-        try:
-            async with eng.connect() as conn:
-                q = sa.select([configs.c.country, sa.func.count(configs.c.id).label('cnt')])\
-                      .where(configs.c.ok == True)\
-                      .group_by(configs.c.country)\
-                      .order_by(sa.func.count(configs.c.id).desc())
-                res = await conn.execute(q)
-                rows = res.fetchall()
-        except Exception:
-            rows = []
-
-        if not rows:
+            processed += len(rows)
+            # update job progress
             try:
-                if edit_chat is not None and edit_msg is not None:
-                    await self.tg.edit_message(edit_chat, edit_msg, 'После обработки нет доступных конфигов.')
-                else:
-                    await self.tg.send_message(chat_id, 'После обработки нет доступных конфигов.')
+                async with eng.begin() as conn:
+                    await conn.execute(jobs.update().where(jobs.c.id == job_id).values(processed_count=processed, inserted=total_inserted))
             except Exception:
                 pass
-            return
 
-        lines = []
-        for row in rows:
-            country = row[0] or 'Unknown'
-            lines.append(f'{country} | {row[1]}')
-        summary = '\n'.join(lines)
-        try:
+            # report progress
             if edit_chat is not None and edit_msg is not None:
-                await self.tg.edit_message(edit_chat, edit_msg, 'Готово. Список доступных конфигов по странам:\n' + summary +
-                                           '\n\nЧтобы получить конфиги: отправьте команду:\n/get <COUNTRY_CODE> <COUNT>\nнапример: /get DE 10')
-            else:
-                await self.tg.send_message(chat_id, 'Готово. Список доступных конфигов по странам:\n' + summary +
-                                           '\n\nЧтобы получить конфиги: отправьте команду:\n/get <COUNTRY_CODE> <COUNT>\nнапример: /get DE 10')
-        except Exception:
-            pass
+                try:
+                    await self.tg.edit_message(edit_chat, edit_msg, f'Проверено ~{processed}/{total_entries} (вставлено {total_inserted})')
+                except Exception:
+                    pass
 
-    async def handle_update(self, update: Dict[str, Any]):
-        """
-        Handle incoming Telegram update (message / edited_message).
-        Supports:
-         - /configs : triggers run_collection and shows progress
-         - /get <COUNTRY> <COUNT> : returns configs
-         - interactive pending flow is handled elsewhere (if used)
-        """
+            # small pause
+            await asyncio.sleep(0.2)
+async def handle_update(self, update: Dict[str, Any]):
+        # callback handling
+        if 'callback_query' in update:
+            cq = update['callback_query']
+            data = cq.get('data')
+            user_id = cq['from']['id']
+            try:
+                await self.tg.answer_callback(cq.get('id'), text='Обработка...')
+            except Exception:
+                pass
+            if data == 'configs_new':
+                msg = await self.tg.send_message(user_id, 'Запуск сбора конфигов...')
+                if msg:
+                    edit_chat, edit_msg = msg
+                else:
+                    edit_chat, edit_msg = user_id, None
+                try:
+                    await self.run_collection(user_id, edit_chat=edit_chat, edit_msg=edit_msg)
+                except Exception as e:
+                    await self.tg.send_message(user_id, f'Ошибка в процессе сбора: {e}')
+                return
+            if data == 'configs_use':
+                await self.ensure_db()
+                eng = get_engine()
+                async with eng.connect() as conn:
+                    q = sa.select([configs.c.country, sa.func.count(configs.c.id).label('cnt')]).where(configs.c.ok==True).group_by(configs.c.country).order_by(sa.desc('cnt'))
+                    res = await conn.execute(q)
+                    rows = res.fetchall()
+                if not rows:
+                    await self.tg.send_message(user_id, 'База пуста.')
+                    return
+                kb = []
+                for country, cnt in rows:
+                    code = country or 'Unknown'
+                    label = f"{code} — {cnt}"
+                    kb.append([{'text': label, 'callback_data': f'pick_{code}'}])
+                await self.tg.send_inline_keyboard(user_id, 'Выберите страну (нажмите кнопку):', kb)
+                return
+            if data and data.startswith('pick_'):
+                code = data.split('pick_',1)[1]
+                self._pending[user_id] = code
+                await self.tg.send_message(user_id, f'Вы выбрали {code}. Введите желаемое количество конфигов (числом).')
+                return
+
         message = update.get('message') or update.get('edited_message')
         if not message:
             return
         text = (message.get('text') or '').strip()
         chat_id = message['chat']['id']
-        message_id = message.get('message_id')
+        message_id = message['message_id']
 
-        # Ensure DB
         await self.ensure_db()
 
-        # /configs command - start pipeline and send progress edits
         if text.startswith('/configs'):
-            msg = await self.tg.send_message(chat_id, 'Запуск сбора конфигов...') or (chat_id, message_id)
-            if isinstance(msg, tuple):
-                edit_chat, edit_msg = msg
-            else:
-                # If send_message returned None or unexpected, fallback
-                edit_chat, edit_msg = chat_id, None
-            await self.run_collection(chat_id, edit_chat=edit_chat, edit_msg=edit_msg)
+            try:
+                kb = [
+                    [{"text":"Новый поиск 🔍","callback_data":"configs_new"}],
+                    [{"text":"Использовать базу 🗂️","callback_data":"configs_use"}]
+                ]
+                await self.tg.send_inline_keyboard(chat_id, "Хотите произвести новый поиск или воспользоваться уже существующей базой?", kb)
+            except Exception as e:
+                await self.tg.send_message(chat_id, f'Ошибка при отправке клавиатуры: {e}')
             return
 
-        # /get command
+        if message.get('from') and message['from'].get('id') in self._pending:
+            pending_country = self._pending.pop(message['from']['id'])
+            if text.isdigit():
+                count = int(text)
+                eng = get_engine()
+                async with eng.connect() as conn:
+                    q = sa.select([configs.c.raw]).where(sa.func.coalesce(configs.c.country, 'Unknown') == pending_country).where(configs.c.ok==True).limit(count)
+                    res = await conn.execute(q)
+                    rows = [r[0] for r in res.fetchall()]
+                if not rows:
+                    await self.tg.send_message(chat_id, f'Нет конфигов для страны {pending_country}')
+                else:
+                    lines = rows
+                    chunks = chunks_from_lines(lines)
+                    if len(chunks) <= 8:
+                        for c in chunks:
+                            await self.tg.send_message(chat_id, c)
+                    else:
+                        all_text = '\n'.join(lines)
+                        fname = f'configs_{pending_country}_{count}.txt'
+                        await self.tg.send_document(chat_id, fname, all_text.encode('utf-8'), caption=f'Configs {pending_country} ({count})')
+                await self.tg.send_message(chat_id, 'Готово. Конфиги отправлены.')
+                return
+            else:
+                await self.tg.send_message(chat_id, 'Ожидаю число. Попробуйте ещё раз.')
+                return
+
         if text.startswith('/get'):
             parts = text.split()
             if len(parts) < 3:
@@ -324,76 +391,25 @@ class JobManager:
             country = parts[1]
             try:
                 count = int(parts[2])
-            except Exception:
+            except:
                 await self.tg.send_message(chat_id, 'Количество должно быть числом.')
                 return
-            # fetch from DB
             await self.ensure_db()
             eng = get_engine()
-            try:
-                async with eng.connect() as conn:
-                    q = sa.select([configs.c.raw])\
-                          .where(sa.func.coalesce(configs.c.country, 'Unknown') == country)\
-                          .where(configs.c.ok == True).limit(count)
-                    res = await conn.execute(q)
-                    rows = [r[0] for r in res.fetchall()]
-            except Exception:
-                rows = []
+            async with eng.connect() as conn:
+                q = sa.select([configs.c.raw]).where(sa.func.coalesce(configs.c.country, 'Unknown') == country).where(configs.c.ok==True).limit(count)
+                res = await conn.execute(q)
+                rows = [r[0] for r in res.fetchall()]
             if not rows:
                 await self.tg.send_message(chat_id, f'Нет конфигов для страны {country}')
                 return
             lines = rows
             chunks = chunks_from_lines(lines)
-            # If small number of chunks, send as messages; otherwise send as document
             if len(chunks) <= 8:
                 for c in chunks:
                     await self.tg.send_message(chat_id, c)
             else:
                 all_text = '\n'.join(lines)
                 fname = f'configs_{country}_{count}.txt'
-                await self.tg.send_document(chat_id, fname, all_text.encode('utf-8'),
-                                           caption=f'Configs {country} ({count})')
+                await self.tg.send_document(chat_id, fname, all_text.encode('utf-8'), caption=f'Configs {country} ({count})')
             await self.tg.send_message(chat_id, 'Готово. Конфиги отправлены.')
-            return
-
-        # If user responded with a number after an interactive pick (pending), handle that
-        # (This assumes some external flow set self._pending[user_id] = country)
-        from_id = message['from']['id']
-        if from_id in self._pending:
-            pending_country = self._pending.pop(from_id)
-            if text.isdigit():
-                count = int(text)
-                # fetch and send (same as /get)
-                await self.ensure_db()
-                eng = get_engine()
-                try:
-                    async with eng.connect() as conn:
-                        q = sa.select([configs.c.raw])\
-                              .where(sa.func.coalesce(configs.c.country, 'Unknown') == pending_country)\
-                              .where(configs.c.ok == True).limit(count)
-                        res = await conn.execute(q)
-                        rows = [r[0] for r in res.fetchall()]
-                except Exception:
-                    rows = []
-                if not rows:
-                    await self.tg.send_message(chat_id, f'Нет конфигов для страны {pending_country}')
-                    return
-                lines = rows
-                chunks = chunks_from_lines(lines)
-                if len(chunks) <= 8:
-                    for c in chunks:
-                        await self.tg.send_message(chat_id, c)
-                else:
-                    all_text = '\n'.join(lines)
-                    fname = f'configs_{pending_country}_{count}.txt'
-                    await self.tg.send_document(chat_id, fname, all_text.encode('utf-8'),
-                                                caption=f'Configs {pending_country} ({count})')
-                await self.tg.send_message(chat_id, 'Готово. Конфиги отправлены.')
-                return
-            else:
-                await self.tg.send_message(chat_id, 'Ожидаю число. Попробуйте ещё раз.')
-                return
-
-        # If nothing matched, ignore or send help
-        # await self.tg.send_message(chat_id, 'Неизвестная команда. Используйте /configs или /get <COUNTRY> <COUNT>')
-        return

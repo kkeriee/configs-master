@@ -60,3 +60,31 @@ class TelegramClient:
                 if d.get('ok'):
                     return (d['result']['chat']['id'], d['result']['message_id'])
                 return None
+
+
+    async def send_inline_keyboard(self, chat_id:int, text:str, keyboard: list, reply_to_message_id=None):
+        import json as _json
+        payload = {'chat_id': chat_id, 'text': text, 'reply_markup': _json.dumps({'inline_keyboard': keyboard})}
+        if reply_to_message_id:
+            payload['reply_to_message_id'] = reply_to_message_id
+        async with self._lock:
+            async with self.session.post(f'{self.api}/sendMessage', json=payload) as resp:
+                try:
+                    d = await resp.json()
+                except Exception:
+                    d = {}
+                if d.get('ok'):
+                    return (d['result']['chat']['id'], d['result']['message_id'])
+                return None
+
+    async def answer_callback(self, callback_query_id: str, text: str = None, show_alert: bool = False):
+        data = {'callback_query_id': callback_query_id}
+        if text:
+            data['text'] = text
+            data['show_alert'] = show_alert
+        async with self._lock:
+            async with self.session.post(f'{self.api}/answerCallbackQuery', json=data) as resp:
+                try:
+                    return await resp.json()
+                except Exception:
+                    return {}
