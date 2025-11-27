@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+aiohttp
+aiodns
+asyncpg
+sqlalchemy>=1.4
+sqlalchemy[asyncio]
+python-dotenv
+dnspython
